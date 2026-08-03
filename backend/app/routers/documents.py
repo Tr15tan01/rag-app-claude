@@ -1,8 +1,11 @@
+import asyncio
+import logging
+
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-import logging
 
+from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.guardrails import validate_upload
@@ -35,12 +38,33 @@ async def upload_document(
         if not chunks:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "No extractable text found in this PDF (it may be scanned/image-only).")
 
-        # Embed in batches to keep individual API requests reasonably sized
-        batch_size = 64
+        # Embed in small batches with pacing so free-tier rate limits
+        # (e.g. Voyage's 3 RPM / 10K TPM without a payment method) aren't
+        # exceeded. ~4 chars/token is a safe rough estimate for English text.
         texts = [c["text"] for c in chunks]
+        max_tokens_per_batch = 8000  # stay under a 10K TPM budget with margin
+        max_chunks_per_batch = 20
+        seconds_between_requests = 21  # keeps you under ~3 requests/minute
+
+        batches, current_batch, current_tokens = [], [], 0
+        for t in texts:
+            est_tokens = max(1, len(t) // 4)
+            if current_batch and (
+                current_tokens + est_tokens > max_tokens_per_batch
+                or len(current_batch) >= max_chunks_per_batch
+            ):
+                batches.append(current_batch)
+                current_batch, current_tokens = [], 0
+            current_batch.append(t)
+            current_tokens += est_tokens
+        if current_batch:
+            batches.append(current_batch)
+
         all_embeddings = []
-        for i in range(0, len(texts), batch_size):
-            all_embeddings.extend(await embed_texts(texts[i : i + batch_size]))
+        for i, batch in enumerate(batches):
+            if i > 0:
+                await asyncio.sleep(seconds_between_requests)
+            all_embeddings.extend(await embed_texts(batch))
 
         for c, emb in zip(chunks, all_embeddings):
             db.add(
